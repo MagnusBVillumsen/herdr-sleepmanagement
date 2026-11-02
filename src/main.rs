@@ -48,9 +48,9 @@ enum Cmd {
     },
     /// Sleep this machine once its agents have been done for a while
     WhenDone {
-        /// How long agents must have been done
-        #[arg(long, default_value = "5m")]
-        grace: String,
+        /// How long agents must have been done [default: grace from [sleep], or 5m]
+        #[arg(long)]
+        grace: Option<String>,
         /// Keep waiting in the background
         #[arg(long)]
         detach: bool,
@@ -301,7 +301,7 @@ struct Policy {
 }
 
 fn policy(config: &Config) -> Result<Option<Policy>> {
-    let Some(s) = &config.sleep else {
+    let Some(s) = config.sleep.as_ref().filter(|s| s.auto) else {
         return Ok(None);
     };
     Ok(Some(Policy {
@@ -343,7 +343,7 @@ fn watch(hook: bool, dry_run: bool, config: &Config, path: &Path) -> Result<()> 
         if hook {
             return Ok(());
         }
-        bail!("no [sleep] section in {}", path.display());
+        bail!("no [sleep] with auto = true in {}", path.display());
     };
     let _lock = match lock(!hook)? {
         Some(l) => l,
@@ -404,7 +404,10 @@ fn status(config: &Config, path: &Path) -> Result<()> {
                 if host::locked() { "locked" } else { "unlocked" },
             );
         }
-        None => println!("  policy   none (no [sleep] in {})", path.display()),
+        None => println!(
+            "  policy   manual only (no auto = true in {})",
+            path.display()
+        ),
     }
     match pending() {
         Some((pid, grace)) => {
@@ -513,13 +516,22 @@ fn main() -> Result<()> {
         }
         Cmd::WhenDone {
             grace,
-            detach: true,
+            detach: wait_elsewhere,
             dry_run,
         } => {
+            let grace = grace.unwrap_or_else(|| {
+                config
+                    .sleep
+                    .as_ref()
+                    .map_or_else(config::default_grace, |s| s.grace.clone())
+            });
             config::duration(&grace)?;
-            detach(&grace, dry_run, &cli.config)
+            if wait_elsewhere {
+                detach(&grace, dry_run, &cli.config)
+            } else {
+                when_done(&grace, dry_run, &config)
+            }
         }
-        Cmd::WhenDone { grace, dry_run, .. } => when_done(&grace, dry_run, &config),
         Cmd::Cancel => cancel(),
         Cmd::Watch { hook, dry_run } => watch(hook, dry_run, &config, &path),
         Cmd::Status => status(&config, &path),

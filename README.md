@@ -3,11 +3,13 @@
 `herdr-sleep` lets the machines that run your [Herdr](https://herdr.dev) agents
 sleep when there is nothing to do, and wakes them again when there is.
 
-- **A sleep policy** such as "sleep at night, when the screen is locked and
-  nothing has happened for 10 minutes", applied by Herdr itself: install the
-  plugin and write a config file.
-- **Sleep when agents are done**: a one-off for when you walk away. The
-  machine suspends once the last agent finishes.
+- **Sleep when you are done**: tell a machine you are leaving, and it
+  suspends once its agents, and the background commands they started, have
+  finished. Nothing happens unless you ask, so a machine you are using stays
+  on. It is per machine: only the agents running there count.
+- **An automatic policy** (opt-in, `auto = true`) such as "sleep at night,
+  when the screen is locked and nothing has happened for 10 minutes", applied
+  by Herdr itself through the plugin's hooks.
 - **`herdr-sleep wake`**: wake a machine with Wake-on-LAN, directly or through
   an always-on host on its LAN, and wait until it answers on SSH. Other tools
   can call it before connecting.
@@ -15,10 +17,8 @@ sleep when there is nothing to do, and wakes them again when there is.
 ```
 $ herdr-sleep status
 thor
-  policy   sleep after 10m idle, 23:00-07:00, only when locked, busy at 10% cpu
-  now      outside window · unlocked
-  pending  nothing
-  watcher  running
+  policy   manual only
+  pending  sleeps when agents are done (grace 5m, pid 81234)
   awake    w1:pB claude  working
            w4:p2 claude  background: cargo build --release 35% cpu
 
@@ -50,21 +50,23 @@ herdr plugin install MagnusBVillumsen/herdr-sleepmanagement
 
 This builds the plugin with `cargo` and does two things:
 
-- It applies your `[sleep]` policy (see below). Herdr starts a watcher when
-  it starts and whenever an agent changes state; only one runs at a time, and
-  it stops with Herdr. Without a `[sleep]` section it does nothing.
-- It adds the actions **Sleep when agents are done** and **Cancel sleep**.
-  Bind them in `~/.config/herdr/config.toml`:
+- It adds the actions **Sleep when agents are done** and **Cancel sleep**,
+  which you bind to keys in `~/.config/herdr/config.toml`. This is the
+  normal use: press it when you leave the machine.
+- With `auto = true` it also applies the automatic policy (see below). Herdr
+  starts a watcher when it starts and whenever an agent changes state; only
+  one runs at a time, and it stops with Herdr. Without `auto` it does nothing
+  on its own.
 
 ```toml
 [[keys.command]]
-key = "prefix+z"
+key = "prefix+shift+s"
 type = "plugin_action"
 command = "herdr-sleep.sleep"
 description = "sleep when agents are done"
 
 [[keys.command]]
-key = "prefix+Z"
+key = "prefix+shift+z"
 type = "plugin_action"
 command = "herdr-sleep.cancel"
 description = "cancel sleep"
@@ -100,13 +102,16 @@ relay = "magnus@loke"      # send the packet from this host over SSH
 [machines.mimir]
 wake = "ssh mimir-bmc power on"   # any shell command, instead of mac
 
-# This machine's sleep policy.
+# How this machine sleeps.
 [sleep]
 command = "systemctl suspend"   # default
-grace = "10m"                   # how long it must be idle; default
+grace = "5m"                    # how long it must be idle; default
+busy_cpu = 10                   # percent of one core; default
+
+# Only for the automatic policy; when-done ignores these.
+auto = false                    # default: sleep only when asked
 window = "23:00-07:00"          # local time; leave out to allow any time
 require_locked = true           # default
-busy_cpu = 10                   # percent of one core; default
 ```
 
 Without `relay`, the magic packet is broadcast from the machine running
@@ -133,12 +138,15 @@ herdr-sleep status
 does) and 1 if it does not within the timeout. `--check` only reports, and
 never wakes anything.
 
-`when-done` ignores the window and the lock: you asked for it. It waits in
+`when-done` sleeps the machine it runs on, and ignores `auto`, the window and
+the lock: you asked for it. To send another machine to bed, run it there, e.g.
+`ssh thor herdr-sleep when-done --detach`. It waits in
 the foreground; `--detach` keeps it waiting in the background after the shell
 exits. Only one can be pending, and `cancel` stops it. The sleep command and
 `busy_cpu` come from `[sleep]` when it is there.
 
-`watch` applies the `[sleep]` policy, checking every 30 seconds. The grace
+`watch` applies the automatic policy when `auto = true`, checking every 30
+seconds; without it, the plugin's hooks exit at once. The grace
 period always starts over after the machine resumes, so it does not go
 straight back to sleep. `--hook` is what the plugin runs. Try a policy with
 `herdr-sleep watch --dry-run` first: it prints the sleep command instead of

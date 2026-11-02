@@ -27,7 +27,8 @@ pub struct Machine {
     pub wake: Option<String>,
 }
 
-/// This machine's sleep policy, applied by `watch`.
+/// How this machine sleeps. `when-done` uses it as given; `watch` only acts
+/// when `auto` is on.
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Sleep {
@@ -35,6 +36,9 @@ pub struct Sleep {
     pub command: String,
     #[serde(default = "default_grace")]
     pub grace: String,
+    /// Sleep on its own, without anyone asking, under the rules below.
+    #[serde(default)]
+    pub auto: bool,
     pub window: Option<String>,
     #[serde(default = "default_true")]
     pub require_locked: bool,
@@ -47,8 +51,8 @@ fn default_command() -> String {
     "systemctl suspend".into()
 }
 
-fn default_grace() -> String {
-    "10m".into()
+pub fn default_grace() -> String {
+    "5m".into()
 }
 
 pub fn default_busy_cpu() -> f64 {
@@ -194,6 +198,7 @@ mac = "fc:9d:05:67:a8:a8"
 relay = "magnus@loke"
 
 [sleep]
+auto = true
 window = "23:00-07:00"
 "#,
         )
@@ -201,8 +206,13 @@ window = "23:00-07:00"
         assert_eq!(c.machines["thor"].relay.as_deref(), Some("magnus@loke"));
         let s = c.sleep.unwrap();
         assert_eq!(
-            (s.command.as_str(), s.grace.as_str(), s.require_locked),
-            ("systemctl suspend", "10m", true)
+            (
+                s.command.as_str(),
+                s.grace.as_str(),
+                s.auto,
+                s.require_locked
+            ),
+            ("systemctl suspend", "5m", true, true)
         );
     }
 }
