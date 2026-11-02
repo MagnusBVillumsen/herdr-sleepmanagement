@@ -1,6 +1,6 @@
 [package]
 name = "herdr-sleep"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2024"
 description = "Wake machines, and put them to sleep once their Herdr agents are done"
 license = "MIT OR Apache-2.0"

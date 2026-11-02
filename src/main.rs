@@ -1,7 +1,9 @@
+mod activity;
 mod config;
 mod host;
 mod wake;
 
+use std::fs::File;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant, SystemTime};
@@ -10,6 +12,7 @@ use anyhow::{Context, Result, bail};
 use chrono::Timelike;
 use clap::{Parser, Subcommand};
 
+use activity::{Awake, Monitor};
 use config::{Config, Window};
 
 #[derive(Parser)]
@@ -43,9 +46,9 @@ enum Cmd {
         #[arg(long)]
         dry_run: bool,
     },
-    /// Sleep this machine once no Herdr agent has been working for a while
+    /// Sleep this machine once its agents have been done for a while
     WhenDone {
-        /// How long agents must have stopped working
+        /// How long agents must have been done
         #[arg(long, default_value = "5m")]
         grace: String,
         /// Keep waiting in the background
@@ -57,18 +60,24 @@ enum Cmd {
     },
     /// Cancel a pending when-done
     Cancel,
-    /// Apply this machine's [sleep] policy until stopped (for a user service)
+    /// Apply this machine's [sleep] policy
     Watch {
+        /// Run as a Herdr hook: exit at once if there is no policy or another
+        /// watcher is running, and exit when Herdr does
+        #[arg(long)]
+        hook: bool,
         /// Print the sleep command instead of running it
         #[arg(long)]
         dry_run: bool,
     },
-    /// Show this machine's policy and which machines are up
+    /// Show this machine's policy, what keeps it awake, and which machines are up
     Status,
 }
 
 const WHEN_DONE_POLL: Duration = Duration::from_secs(15);
 const WATCH_POLL: Duration = Duration::from_secs(30);
+/// Failed `herdr agent list` calls in a row before a hook gives up.
+const HERDR_GONE: u32 = 3;
 const DEFAULT_SLEEP: &str = "systemctl suspend";
 
 fn state_dir() -> PathBuf {
@@ -80,6 +89,34 @@ fn state_dir() -> PathBuf {
 
 fn pending_file() -> PathBuf {
     state_dir().join("when-done")
+}
+
+/// Where the watcher lock lives: the same file for the Herdr hook and a
+/// service, so the two never run at once.
+fn lock_file() -> PathBuf {
+    std::env::var_os("XDG_RUNTIME_DIR")
+        .map(|d| PathBuf::from(d).join("herdr-sleep"))
+        .unwrap_or_else(state_dir)
+        .join("watch.lock")
+}
+
+/// Takes the watcher lock, or returns `None` if another process holds it.
+/// The kernel releases it when this process exits, however it exits.
+fn lock(wait: bool) -> Result<Option<File>> {
+    let path = lock_file();
+    if let Some(dir) = path.parent() {
+        std::fs::create_dir_all(dir)?;
+    }
+    let f = File::create(&path).with_context(|| format!("opening {}", path.display()))?;
+    if wait {
+        f.lock().context("locking the watcher")?;
+        return Ok(Some(f));
+    }
+    match f.try_lock() {
+        Ok(()) => Ok(Some(f)),
+        Err(std::fs::TryLockError::WouldBlock) => Ok(None),
+        Err(std::fs::TryLockError::Error(e)) => Err(e).context("locking the watcher"),
+    }
 }
 
 fn alive(pid: u32) -> bool {
@@ -111,8 +148,9 @@ fn sleep_now(command: &str, dry_run: bool) -> Result<()> {
     Ok(())
 }
 
-/// Tracks how long agents have been done, across polls. A suspend in between
-/// restarts the count, so a machine that just woke up gets a full grace period.
+/// Tracks how long the machine has been idle, across polls. A suspend in
+/// between restarts the count, so a machine that just woke up gets a full
+/// grace period.
 struct Quiet {
     since: Option<Instant>,
     last: (Instant, SystemTime),
@@ -126,8 +164,9 @@ impl Quiet {
         }
     }
 
-    /// Records a poll and returns how long agents have been done.
-    fn observe(&mut self, working: usize) -> Duration {
+    /// Records a poll and returns how long the machine has been idle.
+    /// The monotonic clock stops during suspend; the wall clock does not.
+    fn observe(&mut self, busy: bool) -> Duration {
         let (mono, wall) = (Instant::now(), SystemTime::now());
         let slept = wall
             .duration_since(self.last.1)
@@ -135,7 +174,7 @@ impl Quiet {
             .saturating_sub(mono - self.last.0)
             > Duration::from_secs(60);
         self.last = (mono, wall);
-        if working > 0 || slept {
+        if busy || slept {
             self.since = None;
             return Duration::ZERO;
         }
@@ -147,19 +186,26 @@ impl Quiet {
     }
 }
 
-/// The user manager has its own environment, so pass on what finds Herdr.
-fn forwarded_env() -> Vec<String> {
-    std::env::vars()
-        .filter(|(k, _)| k == "PATH" || k.starts_with("HERDR_") || k.starts_with("XDG_"))
-        .map(|(k, v)| format!("--setenv={k}={v}"))
-        .collect()
+fn busy_cpu(config: &Config) -> f64 {
+    config
+        .sleep
+        .as_ref()
+        .map_or(config::default_busy_cpu(), |s| s.busy_cpu)
+}
+
+fn summary(awake: &[Awake]) -> String {
+    match awake {
+        [] => "nothing keeps it awake".into(),
+        [a] => a.to_string(),
+        [a, rest @ ..] => format!("{a} (+{} more)", rest.len()),
+    }
 }
 
 fn detach(grace: &str, dry_run: bool, config: &Option<PathBuf>) -> Result<()> {
     if let Some((pid, g)) = pending() {
         bail!("already waiting (pid {pid}, grace {g}); run `herdr-sleep cancel` first");
     }
-    let exe = std::env::current_exe()?;
+    use std::os::unix::process::CommandExt;
     let mut args: Vec<String> = Vec::new();
     if let Some(c) = config {
         args.extend(["--config".into(), c.display().to_string()]);
@@ -168,35 +214,18 @@ fn detach(grace: &str, dry_run: bool, config: &Option<PathBuf>) -> Result<()> {
     if dry_run {
         args.push("--dry-run".into());
     }
-    // A user unit outlives the terminal or Herdr popup that started it.
-    let unit = Command::new("systemd-run")
-        .args([
-            "--user",
-            "--collect",
-            "--quiet",
-            "--unit=herdr-sleep-when-done",
-        ])
-        .args(forwarded_env())
-        .arg(&exe)
+    std::fs::create_dir_all(state_dir())?;
+    let log = File::create(state_dir().join("when-done.log"))?;
+    Command::new(std::env::current_exe()?)
         .args(&args)
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status();
-    if !unit.is_ok_and(|s| s.success()) {
-        use std::os::unix::process::CommandExt;
-        std::fs::create_dir_all(state_dir())?;
-        let log = std::fs::File::create(state_dir().join("when-done.log"))?;
-        Command::new(&exe)
-            .args(&args)
-            .stdin(Stdio::null())
-            .stdout(log.try_clone()?)
-            .stderr(log)
-            .process_group(0)
-            .spawn()
-            .context("starting when-done in the background")?;
-    }
+        .stdin(Stdio::null())
+        .stdout(log.try_clone()?)
+        .stderr(log)
+        .process_group(0)
+        .spawn()
+        .context("starting when-done in the background")?;
     println!(
-        "{} sleeps once no agent has been working for {grace}. `herdr-sleep cancel` stops it.",
+        "{} sleeps once its agents have been done for {grace}. `herdr-sleep cancel` stops it.",
         host::hostname()
     );
     Ok(())
@@ -215,19 +244,22 @@ fn when_done(grace: &str, dry_run: bool, config: &Config) -> Result<()> {
     std::fs::create_dir_all(state_dir())?;
     std::fs::write(pending_file(), format!("{} {grace}", std::process::id()))?;
     let _record = Record;
+    println!(
+        "{} sleeps once its agents have been done for {grace}",
+        host::hostname()
+    );
+    let mut monitor = Monitor::primed(busy_cpu(config));
     let mut quiet = Quiet::new();
-    let mut last_working = usize::MAX;
+    let mut last = String::new();
     loop {
-        let working = host::working_agents();
-        let done_for = quiet.observe(working);
-        if working != last_working {
-            match working {
-                0 => println!("no agent working; sleeping in {}", config::human(grace_d)),
-                n => println!("waiting for {n} working agent(s)"),
-            }
-            last_working = working;
+        let awake = monitor.poll(busy_cpu(config)).unwrap_or_default();
+        let done_for = quiet.observe(!awake.is_empty());
+        let now = summary(&awake);
+        if now != last {
+            println!("{now}");
+            last = now;
         }
-        if working == 0 && done_for >= grace_d {
+        if awake.is_empty() && done_for >= grace_d {
             return sleep_now(&command, dry_run);
         }
         std::thread::sleep(
@@ -265,6 +297,7 @@ struct Policy {
     grace: Duration,
     window: Option<Window>,
     require_locked: bool,
+    busy_cpu: f64,
 }
 
 fn policy(config: &Config) -> Result<Option<Policy>> {
@@ -276,6 +309,7 @@ fn policy(config: &Config) -> Result<Option<Policy>> {
         grace: config::duration(&s.grace)?,
         window: s.window.as_deref().map(Window::parse).transpose()?,
         require_locked: s.require_locked,
+        busy_cpu: s.busy_cpu,
     }))
 }
 
@@ -285,10 +319,7 @@ fn minute_now() -> u32 {
 }
 
 fn describe(p: &Policy) -> String {
-    let mut s = format!(
-        "sleep after {} without working agents",
-        config::human(p.grace)
-    );
+    let mut s = format!("sleep after {} idle", config::human(p.grace));
     if let Some(w) = p.window {
         s += &format!(
             ", {:02}:{:02}-{:02}:{:02}",
@@ -301,20 +332,50 @@ fn describe(p: &Policy) -> String {
     if p.require_locked {
         s += ", only when locked";
     }
-    s
+    s + &format!(", busy at {}% cpu", p.busy_cpu)
 }
 
-fn watch(dry_run: bool, config: &Config, path: &Path) -> Result<()> {
+/// Polls every 30 seconds and sleeps once the machine is idle, inside the
+/// window and locked. As a hook it exits when Herdr stops answering, so it
+/// never outlives the server; the next startup or event starts a new one.
+fn watch(hook: bool, dry_run: bool, config: &Config, path: &Path) -> Result<()> {
     let Some(p) = policy(config)? else {
+        if hook {
+            return Ok(());
+        }
         bail!("no [sleep] section in {}", path.display());
     };
+    let _lock = match lock(!hook)? {
+        Some(l) => l,
+        None => return Ok(()),
+    };
     println!("{}: {}", host::hostname(), describe(&p));
+    let mut monitor = Monitor::primed(p.busy_cpu);
     let mut quiet = Quiet::new();
+    let mut misses = 0;
     loop {
-        let working = host::working_agents();
-        let done_for = quiet.observe(working);
+        let awake = match monitor.poll(p.busy_cpu) {
+            Some(a) => {
+                misses = 0;
+                a
+            }
+            None if hook => {
+                misses += 1;
+                if misses >= HERDR_GONE {
+                    println!("herdr is gone; stopping");
+                    return Ok(());
+                }
+                std::thread::sleep(WATCH_POLL);
+                continue;
+            }
+            None => Vec::new(),
+        };
+        let done_for = quiet.observe(!awake.is_empty());
         let in_window = p.window.is_none_or(|w| w.contains(minute_now()));
-        if in_window && working == 0 && done_for >= p.grace && (!p.require_locked || host::locked())
+        if in_window
+            && awake.is_empty()
+            && done_for >= p.grace
+            && (!p.require_locked || host::locked())
         {
             if let Err(e) = sleep_now(&p.command, dry_run) {
                 eprintln!("{e:#}");
@@ -328,25 +389,22 @@ fn watch(dry_run: bool, config: &Config, path: &Path) -> Result<()> {
 fn status(config: &Config, path: &Path) -> Result<()> {
     let name = host::hostname();
     println!("{name}");
-    match policy(config)? {
+    let p = policy(config)?;
+    match &p {
         Some(p) => {
-            println!("  policy   {}", describe(&p));
             let in_window = p.window.is_none_or(|w| w.contains(minute_now()));
+            println!("  policy   {}", describe(p));
             println!(
-                "  now      {} · {} · {} working agent(s)",
+                "  now      {} · {}",
                 if in_window {
                     "in window"
                 } else {
                     "outside window"
                 },
                 if host::locked() { "locked" } else { "unlocked" },
-                host::working_agents()
             );
         }
-        None => {
-            println!("  policy   none (no [sleep] in {})", path.display());
-            println!("  now      {} working agent(s)", host::working_agents());
-        }
+        None => println!("  policy   none (no [sleep] in {})", path.display()),
     }
     match pending() {
         Some((pid, grace)) => {
@@ -354,23 +412,38 @@ fn status(config: &Config, path: &Path) -> Result<()> {
         }
         None => println!("  pending  nothing"),
     }
+    match lock(false)? {
+        Some(_) => println!("  watcher  not running"),
+        None => println!("  watcher  running"),
+    }
+
+    let up = std::thread::scope(|s| {
+        let probes = s.spawn(|| {
+            config
+                .machines
+                .iter()
+                .map(|(n, m)| wake::reachable(wake::host(n, m), Duration::from_secs(3)))
+                .collect::<Vec<bool>>()
+        });
+        let busy = busy_cpu(config);
+        let awake = activity::agents().and_then(|_| Monitor::primed(busy).poll(busy));
+        match awake {
+            None => println!("  awake    herdr is not running"),
+            Some(a) if a.is_empty() => {
+                println!("  awake    nothing: no agent working, no busy background command")
+            }
+            Some(a) => {
+                for (i, x) in a.iter().enumerate() {
+                    println!("  {}{x}", if i == 0 { "awake    " } else { "         " });
+                }
+            }
+        }
+        probes.join().unwrap_or_default()
+    });
     if config.machines.is_empty() {
         return Ok(());
     }
     println!();
-    let up: Vec<bool> = std::thread::scope(|s| {
-        let handles: Vec<_> = config
-            .machines
-            .iter()
-            .map(|(n, m)| {
-                s.spawn(move || wake::reachable(wake::host(n, m), Duration::from_secs(3)))
-            })
-            .collect();
-        handles
-            .into_iter()
-            .map(|h| h.join().unwrap_or(false))
-            .collect()
-    });
     for ((n, m), up) in config.machines.iter().zip(up) {
         let how = wake::method(m).unwrap_or_else(|| "no wake method".into());
         println!("  {n:<12} {:<6} {how}", if up { "up" } else { "down" });
@@ -448,7 +521,7 @@ fn main() -> Result<()> {
         }
         Cmd::WhenDone { grace, dry_run, .. } => when_done(&grace, dry_run, &config),
         Cmd::Cancel => cancel(),
-        Cmd::Watch { dry_run } => watch(dry_run, &config, &path),
+        Cmd::Watch { hook, dry_run } => watch(hook, dry_run, &config, &path),
         Cmd::Status => status(&config, &path),
     }
 }
@@ -460,10 +533,10 @@ mod tests {
     #[test]
     fn quiet_counts_from_first_idle_poll() {
         let mut q = Quiet::new();
-        assert_eq!(q.observe(2), Duration::ZERO);
-        assert_eq!(q.observe(0), Duration::ZERO);
+        assert_eq!(q.observe(true), Duration::ZERO);
+        assert_eq!(q.observe(false), Duration::ZERO);
         std::thread::sleep(Duration::from_millis(20));
-        assert!(q.observe(0) >= Duration::from_millis(20));
-        assert_eq!(q.observe(1), Duration::ZERO);
+        assert!(q.observe(false) >= Duration::from_millis(20));
+        assert_eq!(q.observe(true), Duration::ZERO);
     }
 }

@@ -1,17 +1,27 @@
 id = "herdr-sleep"
 name = "Sleep"
-version = "0.1.0"
+version = "0.2.0"
 min_herdr_version = "0.9.5"
-description = "Put this machine to sleep once its agents are done, and wake machines with Wake-on-LAN"
+description = "Put this machine to sleep once its agents and their background commands are done"
 platforms = ["linux"]
 
 [[build]]
 command = ["cargo", "build", "--release", "--locked"]
 
+# Applies the [sleep] policy from ~/.config/herdr-sleep/config.toml. Only one
+# watcher runs at a time; the rest exit at once, as does a watcher with no
+# policy. The watcher exits when Herdr does.
+[[startup]]
+command = ["target/release/herdr-sleep", "watch", "--hook"]
+
+[[events]]
+on = "pane.agent_status_changed"
+command = ["target/release/herdr-sleep", "watch", "--hook"]
+
 [[actions]]
 id = "sleep"
 title = "Sleep when agents are done"
-command = ["target/release/herdr-sleep", "when-done", "--detach"]
+command = ["target/release/herdr-sleep", "when-done"]
 
 [[actions]]
 id = "cancel"

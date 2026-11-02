@@ -27,7 +27,7 @@ pub struct Machine {
     pub wake: Option<String>,
 }
 
-/// This machine's sleep policy, used by `watch`.
+/// This machine's sleep policy, applied by `watch`.
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Sleep {
@@ -38,6 +38,9 @@ pub struct Sleep {
     pub window: Option<String>,
     #[serde(default = "default_true")]
     pub require_locked: bool,
+    /// Percent of one core a background command must use to count as busy.
+    #[serde(default = "default_busy_cpu")]
+    pub busy_cpu: f64,
 }
 
 fn default_command() -> String {
@@ -46,6 +49,10 @@ fn default_command() -> String {
 
 fn default_grace() -> String {
     "10m".into()
+}
+
+pub fn default_busy_cpu() -> f64 {
+    10.0
 }
 
 fn default_true() -> bool {

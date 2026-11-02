@@ -1,25 +1,7 @@
-//! What this machine is doing: Herdr agents and screen lock.
+//! This machine: its name and whether its screen is locked.
 
 use std::collections::HashMap;
 use std::process::Command;
-
-use serde_json::Value;
-
-/// How many Herdr agents are working. Herdr not running counts as none;
-/// agents that are idle or waiting for input count as done.
-pub fn working_agents() -> usize {
-    let bin = std::env::var("HERDR_BIN_PATH").unwrap_or_else(|_| "herdr".into());
-    let Ok(out) = Command::new(bin).args(["agent", "list"]).output() else {
-        return 0;
-    };
-    let Ok(v) = serde_json::from_slice::<Value>(&out.stdout) else {
-        return 0;
-    };
-    v["result"]["agents"]
-        .as_array()
-        .map(|a| a.iter().filter(|x| x["agent_status"] == "working").count())
-        .unwrap_or(0)
-}
 
 fn properties(out: &[u8]) -> HashMap<String, String> {
     String::from_utf8_lossy(out)
