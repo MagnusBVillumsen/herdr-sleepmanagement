@@ -45,6 +45,9 @@ pub struct Sleep {
     /// Percent of one core a background command must use to count as busy.
     #[serde(default = "default_busy_cpu")]
     pub busy_cpu: f64,
+    /// Background commands younger than this count whatever CPU they use.
+    #[serde(default = "default_background_max")]
+    pub background_max: String,
 }
 
 fn default_command() -> String {
@@ -53,6 +56,10 @@ fn default_command() -> String {
 
 pub fn default_grace() -> String {
     "5m".into()
+}
+
+pub fn default_background_max() -> String {
+    "3h".into()
 }
 
 pub fn default_busy_cpu() -> f64 {

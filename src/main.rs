@@ -12,7 +12,7 @@ use anyhow::{Context, Result, bail};
 use chrono::Timelike;
 use clap::{Parser, Subcommand};
 
-use activity::{Awake, Monitor};
+use activity::{Awake, Busy, Monitor};
 use config::{Config, Window};
 
 #[derive(Parser)]
@@ -186,11 +186,15 @@ impl Quiet {
     }
 }
 
-fn busy_cpu(config: &Config) -> f64 {
-    config
-        .sleep
-        .as_ref()
-        .map_or(config::default_busy_cpu(), |s| s.busy_cpu)
+fn busy(config: &Config) -> Result<Busy> {
+    let (cpu, young) = match &config.sleep {
+        Some(s) => (s.busy_cpu, s.background_max.clone()),
+        None => (config::default_busy_cpu(), config::default_background_max()),
+    };
+    Ok(Busy {
+        cpu,
+        young: config::duration(&young)?,
+    })
 }
 
 fn summary(awake: &[Awake]) -> String {
@@ -248,11 +252,11 @@ fn when_done(grace: &str, dry_run: bool, config: &Config) -> Result<()> {
         "{} sleeps once its agents have been done for {grace}",
         host::hostname()
     );
-    let mut monitor = Monitor::primed(busy_cpu(config));
+    let mut monitor = Monitor::primed(busy(config)?);
     let mut quiet = Quiet::new();
     let mut last = String::new();
     loop {
-        let awake = monitor.poll(busy_cpu(config)).unwrap_or_default();
+        let awake = monitor.poll().unwrap_or_default();
         let done_for = quiet.observe(!awake.is_empty());
         let now = summary(&awake);
         if now != last {
@@ -297,7 +301,7 @@ struct Policy {
     grace: Duration,
     window: Option<Window>,
     require_locked: bool,
-    busy_cpu: f64,
+    busy: Busy,
 }
 
 fn policy(config: &Config) -> Result<Option<Policy>> {
@@ -309,7 +313,7 @@ fn policy(config: &Config) -> Result<Option<Policy>> {
         grace: config::duration(&s.grace)?,
         window: s.window.as_deref().map(Window::parse).transpose()?,
         require_locked: s.require_locked,
-        busy_cpu: s.busy_cpu,
+        busy: busy(config)?,
     }))
 }
 
@@ -332,7 +336,11 @@ fn describe(p: &Policy) -> String {
     if p.require_locked {
         s += ", only when locked";
     }
-    s + &format!(", busy at {}% cpu", p.busy_cpu)
+    s + &format!(
+        ", busy at {}% cpu or under {}",
+        p.busy.cpu,
+        config::human(p.busy.young)
+    )
 }
 
 /// Polls every 30 seconds and sleeps once the machine is idle, inside the
@@ -350,11 +358,11 @@ fn watch(hook: bool, dry_run: bool, config: &Config, path: &Path) -> Result<()> 
         None => return Ok(()),
     };
     println!("{}: {}", host::hostname(), describe(&p));
-    let mut monitor = Monitor::primed(p.busy_cpu);
+    let mut monitor = Monitor::primed(p.busy);
     let mut quiet = Quiet::new();
     let mut misses = 0;
     loop {
-        let awake = match monitor.poll(p.busy_cpu) {
+        let awake = match monitor.poll() {
             Some(a) => {
                 misses = 0;
                 a
@@ -428,8 +436,13 @@ fn status(config: &Config, path: &Path) -> Result<()> {
                 .map(|(n, m)| wake::reachable(wake::host(n, m), Duration::from_secs(3)))
                 .collect::<Vec<bool>>()
         });
-        let busy = busy_cpu(config);
-        let awake = activity::agents().and_then(|_| Monitor::primed(busy).poll(busy));
+        let awake = match busy(config) {
+            Ok(b) => activity::agents().and_then(|_| Monitor::primed(b).poll()),
+            Err(e) => {
+                println!("  awake    {e:#}");
+                return probes.join().unwrap_or_default();
+            }
+        };
         match awake {
             None => println!("  awake    herdr is not running"),
             Some(a) if a.is_empty() => {

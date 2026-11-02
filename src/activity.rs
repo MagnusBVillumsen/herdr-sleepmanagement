@@ -3,7 +3,7 @@
 
 use std::collections::HashMap;
 use std::process::Command;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use serde_json::Value;
 
@@ -13,6 +13,8 @@ pub struct Proc {
     /// CPU seconds used so far, including reaped children where the OS
     /// reports them.
     pub cpu: f64,
+    /// Seconds since the process started.
+    pub age: f64,
     pub args: String,
 }
 
@@ -23,7 +25,7 @@ pub fn snapshot() -> Table {
         return proc_table();
     }
     Command::new("ps")
-        .args(["-A", "-o", "pid=,ppid=,time=,args="])
+        .args(["-A", "-o", "pid=,ppid=,etime=,time=,args="])
         .output()
         .map(|o| parse_ps(&String::from_utf8_lossy(&o.stdout)))
         .unwrap_or_default()
@@ -32,6 +34,10 @@ pub fn snapshot() -> Table {
 /// Linux reports CPU time in USER_HZ, which is 100 on every architecture.
 fn proc_table() -> Table {
     let mut t = Table::new();
+    let uptime = std::fs::read_to_string("/proc/uptime")
+        .ok()
+        .and_then(|u| u.split_whitespace().next()?.parse::<f64>().ok())
+        .unwrap_or(0.0);
     let Ok(dir) = std::fs::read_dir("/proc") else {
         return t;
     };
@@ -42,7 +48,9 @@ fn proc_table() -> Table {
         let Ok(stat) = std::fs::read_to_string(e.path().join("stat")) else {
             continue;
         };
-        let Some(p) = parse_stat(&stat) else { continue };
+        let Some(p) = parse_stat(&stat, uptime) else {
+            continue;
+        };
         let args = std::fs::read(e.path().join("cmdline"))
             .map(|b| {
                 b.split(|&c| c == 0)
@@ -57,14 +65,16 @@ fn proc_table() -> Table {
     t
 }
 
-fn parse_stat(stat: &str) -> Option<Proc> {
+fn parse_stat(stat: &str, uptime: f64) -> Option<Proc> {
     let f: Vec<&str> = stat.rsplit_once(')')?.1.split_whitespace().collect();
     let ticks: f64 = (11..15)
         .map(|i| f.get(i).and_then(|v| v.parse::<f64>().ok()))
         .sum::<Option<f64>>()?;
+    let started: f64 = f.get(19)?.parse().ok()?;
     Some(Proc {
         ppid: f.get(1)?.parse().ok()?,
         cpu: ticks / 100.0,
+        age: (uptime - started / 100.0).max(0.0),
         args: String::new(),
     })
 }
@@ -75,14 +85,23 @@ pub fn parse_ps(out: &str) -> Table {
             let mut it = l.split_whitespace();
             let pid = it.next()?.parse().ok()?;
             let ppid = it.next()?.parse().ok()?;
+            let age = cpu_time(it.next()?)?;
             let cpu = cpu_time(it.next()?)?;
             let args = it.collect::<Vec<_>>().join(" ");
-            Some((pid, Proc { ppid, cpu, args }))
+            Some((
+                pid,
+                Proc {
+                    ppid,
+                    cpu,
+                    age,
+                    args,
+                },
+            ))
         })
         .collect()
 }
 
-/// `[[dd-]hh:]mm:ss[.cc]`, as printed by `ps -o time`.
+/// `[[dd-]hh:]mm:ss[.cc]`, as printed by `ps -o time` and `-o etime`.
 fn cpu_time(s: &str) -> Option<f64> {
     let (days, rest) = match s.split_once('-') {
         Some((d, r)) => (d.parse::<f64>().ok()?, r),
@@ -176,31 +195,66 @@ fn short(args: &str) -> String {
     s
 }
 
-/// Background commands under `root` that used at least `busy_cpu` percent
-/// of one core over the `secs` between the two tables: the busiest command
-/// in each tool shell's tree, and the tree's total share.
+/// When a background command keeps the machine awake.
+#[derive(Debug, Clone, Copy)]
+pub struct Busy {
+    /// Percent of one core a background command must use.
+    pub cpu: f64,
+    /// A background command younger than this counts whatever it uses: it is
+    /// usually waiting on something (a container build, a download, CI), and
+    /// the agent picks up again when it ends. Older ones, like a dev server
+    /// left running, only count while they use CPU.
+    pub young: Duration,
+}
+
+#[derive(Debug, PartialEq)]
+pub struct Background {
+    pub cmd: String,
+    pub age: f64,
+    /// Share of one core since the last poll, when it is what counts.
+    pub cpu: Option<f64>,
+}
+
+/// Background commands under `root` that keep the machine awake, one per
+/// tool shell: young ones by their first command, busy ones by their
+/// busiest. CPU is measured over the `secs` since `prev`.
 pub fn background(
-    prev: &Table,
+    prev: Option<&Table>,
     now: &Table,
     secs: f64,
     root: u32,
-    busy_cpu: f64,
-) -> Vec<(String, f64)> {
+    busy: Busy,
+) -> Vec<Background> {
     let kids = children(now);
     tool_shells(now, &kids, root)
         .into_iter()
         .filter_map(|sh| {
             let tree = subtree(&kids, sh);
+            let below = |p: &&u32| **p != sh || tree.len() == 1;
+            let age = now[&sh].age;
+            if age < busy.young.as_secs_f64() {
+                let first = tree.iter().filter(below).min()?;
+                return Some(Background {
+                    cmd: short(&now[first].args),
+                    age,
+                    cpu: None,
+                });
+            }
+            let prev = prev?;
             let total: f64 = tree.iter().map(|&p| used(prev, now, p)).sum();
             let pct = total / secs * 100.0;
-            if pct < busy_cpu {
+            if pct < busy.cpu {
                 return None;
             }
             let top = tree
                 .iter()
-                .filter(|&&p| p != sh || tree.len() == 1)
+                .filter(below)
                 .max_by(|&&a, &&b| used(prev, now, a).total_cmp(&used(prev, now, b)))?;
-            Some((short(&now[top].args), pct))
+            Some(Background {
+                cmd: short(&now[top].args),
+                age,
+                cpu: Some(pct),
+            })
         })
         .collect()
 }
@@ -245,7 +299,7 @@ fn shell_pid(pane: &str) -> Option<u32> {
 
 pub enum Reason {
     Working,
-    Background(String, f64),
+    Background(Background),
 }
 
 pub struct Awake {
@@ -259,30 +313,36 @@ impl std::fmt::Display for Awake {
         write!(f, "{} {}  ", self.pane, self.agent)?;
         match &self.reason {
             Reason::Working => write!(f, "working"),
-            Reason::Background(cmd, pct) => write!(f, "background: {cmd} {pct:.0}% cpu"),
+            Reason::Background(b) => {
+                let age = crate::config::human(Duration::from_secs(b.age as u64));
+                match b.cpu {
+                    Some(pct) => write!(f, "background: {} {pct:.0}% cpu", b.cmd),
+                    None => write!(f, "background: {} (running {age})", b.cmd),
+                }
+            }
         }
     }
 }
 
 /// Polls agents and compares process tables between polls.
-#[derive(Default)]
 pub struct Monitor {
+    busy: Busy,
     prev: Option<(Instant, Table)>,
 }
 
 impl Monitor {
-    /// Takes a first measurement, so the next poll can see background work.
-    pub fn primed(busy_cpu: f64) -> Self {
-        let mut m = Monitor::default();
-        m.poll(busy_cpu);
+    /// Takes a first measurement, so the next poll can see CPU use.
+    pub fn primed(busy: Busy) -> Self {
+        let mut m = Monitor { busy, prev: None };
+        m.poll();
         std::thread::sleep(std::time::Duration::from_secs(2));
         m
     }
 
     /// What keeps the machine awake now, or `None` if Herdr is not running.
-    /// Background work shows from the second poll on. This process and its
+    /// CPU use shows from the second poll on. This process and its
     /// own children are left out, in case it was started from an agent.
-    pub fn poll(&mut self, busy_cpu: f64) -> Option<Vec<Awake>> {
+    pub fn poll(&mut self) -> Option<Vec<Awake>> {
         let agents = agents()?;
         let (at, mut now) = (Instant::now(), snapshot());
         let me = std::process::id();
@@ -297,15 +357,16 @@ impl Monitor {
                 });
                 continue;
             }
-            let (Some((then, prev)), Some(root)) = (&self.prev, shell_pid(&a.pane)) else {
+            let Some(root) = shell_pid(&a.pane) else {
                 continue;
             };
-            let secs = (at - *then).as_secs_f64().max(0.001);
-            for (cmd, pct) in background(prev, &now, secs, root, busy_cpu) {
+            let prev = self.prev.as_ref();
+            let secs = prev.map_or(1.0, |(then, _)| (at - *then).as_secs_f64().max(0.001));
+            for b in background(prev.map(|(_, t)| t), &now, secs, root, self.busy) {
                 out.push(Awake {
                     pane: a.pane.clone(),
                     agent: a.agent.clone(),
-                    reason: Reason::Background(cmd, pct),
+                    reason: Reason::Background(b),
                 });
             }
         }
@@ -318,6 +379,8 @@ impl Monitor {
 mod tests {
     use super::*;
 
+    const OLD: f64 = 46.0 * 3600.0;
+
     fn table(rows: &[(u32, u32, f64, &str)]) -> Table {
         rows.iter()
             .map(|&(pid, ppid, cpu, args)| {
@@ -326,11 +389,21 @@ mod tests {
                     Proc {
                         ppid,
                         cpu,
+                        age: OLD,
                         args: args.into(),
                     },
                 )
             })
             .collect()
+    }
+
+    const BUSY: Busy = Busy {
+        cpu: 10.0,
+        young: Duration::from_secs(3 * 3600),
+    };
+
+    fn cmds(b: Vec<Background>) -> Vec<String> {
+        b.into_iter().map(|b| b.cmd).collect()
     }
 
     const SNAP: &str = "/run/current-system/sw/bin/zsh -c source /home/u/.claude/shell-snapshots/s.sh && eval 'cargo build'";
@@ -378,17 +451,42 @@ mod tests {
     fn idle_server_does_not_count_but_a_build_does() {
         let prev = base(0.0, 0.0, None);
         let now = base(0.3, 3.0, Some(25.0));
-        let busy = background(&prev, &now, 30.0, 10, 10.0);
+        let busy = background(Some(&prev), &now, 30.0, 10, BUSY);
         assert_eq!(busy.len(), 1);
-        let (cmd, pct) = &busy[0];
-        assert_eq!(cmd, "rustc --crate-name foo");
+        assert_eq!(busy[0].cmd, "rustc --crate-name foo");
+        let pct = busy[0].cpu.unwrap();
         assert!((pct - 93.3).abs() < 0.1, "{pct}");
 
         let quiet = base(0.3, 0.0, None);
-        assert!(background(&prev, &quiet, 30.0, 10, 10.0).is_empty());
+        assert!(background(Some(&prev), &quiet, 30.0, 10, BUSY).is_empty());
         assert_eq!(
-            background(&prev, &base(6.0, 0.0, None), 30.0, 10, 10.0)[0].0,
-            "./build/server"
+            cmds(background(
+                Some(&prev),
+                &base(6.0, 0.0, None),
+                30.0,
+                10,
+                BUSY
+            )),
+            ["./build/server"]
+        );
+    }
+
+    #[test]
+    fn young_commands_count_without_cpu() {
+        let mut now = base(0.0, 0.0, None);
+        for (pid, age) in [(30, 480.0), (31, 480.0)] {
+            now.get_mut(&pid).unwrap().age = age;
+        }
+        let young = background(None, &now, 1.0, 10, BUSY);
+        assert_eq!(cmds(young), ["cargo build"]);
+        let prev = now.clone();
+        assert_eq!(
+            background(Some(&prev), &now, 30.0, 10, BUSY)[0],
+            Background {
+                cmd: "cargo build".into(),
+                age: 480.0,
+                cpu: None
+            }
         );
     }
 
@@ -399,7 +497,7 @@ mod tests {
         now.get_mut(&12).unwrap().cpu += 30.0;
         now.get_mut(&14).unwrap().cpu += 30.0;
         now.get_mut(&99).unwrap().cpu += 30.0;
-        assert!(background(&prev, &now, 30.0, 10, 10.0).is_empty());
+        assert!(background(Some(&prev), &now, 30.0, 10, BUSY).is_empty());
     }
 
     #[test]
@@ -416,12 +514,17 @@ mod tests {
     #[test]
     fn parses_process_listings() {
         let t = parse_ps(
-            "  1  0 00:00:48 /sbin/init\n 7 1 1-02:03:04 cargo build\n 8 7 0:01.50 rustc\n",
+            "  1  0 3-00:00:00 00:00:48 /sbin/init\n 7 1 05:00 1-02:03:04 cargo build\n 8 7 00:10 0:01.50 rustc\n",
         );
+        assert_eq!(t[&7].age, 300.0);
         assert_eq!(t[&7].cpu, 86400.0 + 7384.0);
         assert_eq!(t[&8].cpu, 1.5);
         assert_eq!(t[&7].args, "cargo build");
-        let p = parse_stat("42 (a (b) c) S 7 1 1 0 -1 0 0 0 0 0 150 50 30 20 20 0").unwrap();
-        assert_eq!((p.ppid, p.cpu), (7, 2.5));
+        let p = parse_stat(
+            "42 (a (b) c) S 7 1 1 0 -1 0 0 0 0 0 150 50 30 20 20 0 1 0 90000 0",
+            1000.0,
+        )
+        .unwrap();
+        assert_eq!((p.ppid, p.cpu, p.age), (7, 2.5, 100.0));
     }
 }

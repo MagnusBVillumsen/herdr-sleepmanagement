@@ -20,6 +20,7 @@ thor
   policy   manual only
   pending  sleeps when agents are done (grace 5m, pid 81234)
   awake    w1:pB claude  working
+           w3:p1 claude  background: docker build -t android-ci . (running 9m)
            w4:p2 claude  background: cargo build --release 35% cpu
 
   mimir        up     runs `ssh mimir-bmc power on`
@@ -29,14 +30,21 @@ thor
 ## What counts as busy
 
 A machine is busy while any Herdr agent is **working**, or while a command an
-agent started is still using CPU. Agents often report idle while a build or
-test run they started in the background is still going, so `herdr-sleep`
-looks at each agent's tool shells: the `sh -c`, `bash -lc` or `zsh -c`
-processes agents run commands in. If a tool shell and everything below it used
-at least `busy_cpu` percent of one core (default 10) since the last check, the
-machine stays awake. A dev server idling in the background does not count; a
-`cargo build` does. Language servers and MCP servers an agent runs are not
-tool shells and are ignored.
+agent started in the background is still running. Agents often report done
+while a build, a container image or a CI wait they started is still going,
+and pick up again when it ends, so `herdr-sleep` looks at each agent's tool
+shells: the `sh -c`, `bash -lc` or `zsh -c` processes agents run commands in.
+
+- A tool shell younger than `background_max` (default 3h) keeps the machine
+  awake whatever it does. Much background work uses no CPU of its own: a
+  `docker build` waits on the Docker daemon, a CI script sleeps between
+  checks, a download waits on the network.
+- An older one only counts while it and everything below it use at least
+  `busy_cpu` percent of one core (default 10). A dev server left running
+  for days does not keep the machine awake; a long build still does.
+
+Language servers and MCP servers an agent runs are not tool shells and are
+ignored.
 
 Agents that are idle or waiting for input (blocked) count as done: a machine
 should not stay awake all night for a question you will answer in the
@@ -107,6 +115,7 @@ wake = "ssh mimir-bmc power on"   # any shell command, instead of mac
 command = "systemctl suspend"   # default
 grace = "5m"                    # how long it must be idle; default
 busy_cpu = 10                   # percent of one core; default
+background_max = "3h"           # younger background commands always count
 
 # Only for the automatic policy; when-done ignores these.
 auto = false                    # default: sleep only when asked
@@ -143,7 +152,8 @@ the lock: you asked for it. To send another machine to bed, run it there, e.g.
 `ssh thor herdr-sleep when-done --detach`. It waits in
 the foreground; `--detach` keeps it waiting in the background after the shell
 exits. Only one can be pending, and `cancel` stops it. The sleep command and
-`busy_cpu` come from `[sleep]` when it is there.
+`busy_cpu`, `background_max` and `grace` come from `[sleep]` when it is
+there.
 
 `watch` applies the automatic policy when `auto = true`, checking every 30
 seconds; without it, the plugin's hooks exit at once. The grace
