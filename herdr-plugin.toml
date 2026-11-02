@@ -1,0 +1,19 @@
+id = "herdr-sleep"
+name = "Sleep"
+version = "0.1.0"
+min_herdr_version = "0.9.5"
+description = "Put this machine to sleep once its agents are done, and wake machines with Wake-on-LAN"
+platforms = ["linux"]
+
+[[build]]
+command = ["cargo", "build", "--release", "--locked"]
+
+[[actions]]
+id = "sleep"
+title = "Sleep when agents are done"
+command = ["target/release/herdr-sleep", "when-done", "--detach"]
+
+[[actions]]
+id = "cancel"
+title = "Cancel sleep"
+command = ["target/release/herdr-sleep", "cancel"]
