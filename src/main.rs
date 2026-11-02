@@ -72,6 +72,8 @@ enum Cmd {
     },
     /// Show this machine's policy, what keeps it awake, and which machines are up
     Status,
+    /// One line for Herdr's tab bar while a when-done is pending
+    Indicator,
 }
 
 const WHEN_DONE_POLL: Duration = Duration::from_secs(15);
@@ -89,6 +91,22 @@ fn state_dir() -> PathBuf {
 
 fn pending_file() -> PathBuf {
     state_dir().join("when-done")
+}
+
+/// What a pending when-done is waiting on, for `indicator`: `busy <n>`, or
+/// `sleep <unix time>` once nothing keeps the machine awake.
+fn progress_file() -> PathBuf {
+    state_dir().join("when-done.progress")
+}
+
+/// A Herdr toast, when running under Herdr.
+fn notify(title: &str, body: &str) {
+    let bin = std::env::var("HERDR_BIN_PATH").unwrap_or_else(|_| "herdr".into());
+    let _ = Command::new(bin)
+        .args(["notification", "show", title, "--body", body])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status();
 }
 
 /// Where the watcher lock lives: the same file for the Herdr hook and a
@@ -248,9 +266,11 @@ fn when_done(grace: &str, dry_run: bool, config: &Config) -> Result<()> {
     std::fs::create_dir_all(state_dir())?;
     std::fs::write(pending_file(), format!("{} {grace}", std::process::id()))?;
     let _record = Record;
-    println!(
-        "{} sleeps once its agents have been done for {grace}",
-        host::hostname()
+    let name = host::hostname();
+    println!("{name} sleeps once its agents have been done for {grace}");
+    notify(
+        &format!("{name} sleeps when done"),
+        &format!("once its agents have been done for {grace}"),
     );
     let mut monitor = Monitor::primed(busy(config)?);
     let mut quiet = Quiet::new();
@@ -263,7 +283,16 @@ fn when_done(grace: &str, dry_run: bool, config: &Config) -> Result<()> {
             println!("{now}");
             last = now;
         }
+        let progress = match awake.len() {
+            0 => format!(
+                "sleep {}",
+                chrono::Utc::now().timestamp() + grace_d.saturating_sub(done_for).as_secs() as i64
+            ),
+            n => format!("busy {n}"),
+        };
+        let _ = std::fs::write(progress_file(), progress);
         if awake.is_empty() && done_for >= grace_d {
+            notify(&format!("{name} is going to sleep"), &command);
             return sleep_now(&command, dry_run);
         }
         std::thread::sleep(
@@ -278,6 +307,7 @@ struct Record;
 impl Drop for Record {
     fn drop(&mut self) {
         let _ = std::fs::remove_file(pending_file());
+        let _ = std::fs::remove_file(progress_file());
     }
 }
 
@@ -292,8 +322,37 @@ fn cancel() -> Result<()> {
         bail!("could not stop pid {pid}");
     }
     let _ = std::fs::remove_file(pending_file());
-    println!("cancelled; {} stays awake", host::hostname());
+    let _ = std::fs::remove_file(progress_file());
+    let name = host::hostname();
+    println!("cancelled; {name} stays awake");
+    notify("Sleep cancelled", &format!("{name} stays awake"));
     Ok(())
+}
+
+/// One line for Herdr's tab bar while a when-done is pending, and nothing
+/// otherwise, which hides the entry.
+fn indicator() {
+    if pending().is_none() {
+        return;
+    }
+    let raw = std::fs::read_to_string(progress_file()).unwrap_or_default();
+    let text = match raw.split_once(' ') {
+        Some(("busy", n)) => format!(": {n} busy"),
+        Some(("sleep", at)) => match at.trim().parse::<i64>() {
+            Ok(at) => {
+                let left = (at - chrono::Utc::now().timestamp()).max(0) as u64;
+                let left = if left < 60 {
+                    left
+                } else {
+                    left.div_ceil(60) * 60
+                };
+                format!(" in {}", config::human(Duration::from_secs(left)))
+            }
+            Err(_) => String::new(),
+        },
+        _ => String::new(),
+    };
+    println!("💤 sleep{text}");
 }
 
 struct Policy {
@@ -548,6 +607,10 @@ fn main() -> Result<()> {
         Cmd::Cancel => cancel(),
         Cmd::Watch { hook, dry_run } => watch(hook, dry_run, &config, &path),
         Cmd::Status => status(&config, &path),
+        Cmd::Indicator => {
+            indicator();
+            Ok(())
+        }
     }
 }
 

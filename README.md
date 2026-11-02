@@ -95,6 +95,26 @@ The Nix package also contains a ready-built plugin directory, which needs no
 herdr plugin link "$(nix build --print-out-paths github:MagnusBVillumsen/herdr-sleepmanagement)/share/herdr-sleep/plugin"
 ```
 
+### Seeing that it is on
+
+Starting, cancelling and the moment of sleeping each show a Herdr toast. For
+something that stays on screen, add `herdr-sleep indicator` to the status area
+of Herdr's tab bar. It prints `💤 sleep: 2 busy` while it waits, then
+`💤 sleep in 4m`, and nothing when no sleep is pending, which hides the entry:
+
+```toml
+[ui]
+tab_bar_right = [
+  { type = "command", command = "herdr-sleep indicator", interval_seconds = 10, timeout_seconds = 2 },
+]
+```
+
+Tab bar commands run on the Herdr server, so attached to another machine you
+see that machine's state. The command needs `herdr-sleep` on `PATH`: a plugin
+install only builds it inside the plugin, so also run
+`cargo install --git https://github.com/MagnusBVillumsen/herdr-sleepmanagement`
+(or use the Nix package).
+
 ## Configuration
 
 `$XDG_CONFIG_HOME/herdr-sleep/config.toml` (usually
@@ -141,6 +161,7 @@ herdr-sleep when-done [--grace 5m] [--detach] [--dry-run]
 herdr-sleep cancel
 herdr-sleep watch [--hook] [--dry-run]
 herdr-sleep status
+herdr-sleep indicator
 ```
 
 `wake` exits 0 once the machine answers on SSH (or right away if it already
